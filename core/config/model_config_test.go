@@ -1,8 +1,6 @@
 package config
 
 import (
-	"io"
-	"net/http"
 	"os"
 	"path/filepath"
 
@@ -50,6 +48,54 @@ parameters:
 		valid, err := cfg.Validate()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(valid).To(BeTrue())
+	})
+
+	It("round-trips context compression settings", func() {
+		raw := []byte(`
+name: compressed-chat
+backend: llama-cpp
+parameters:
+  model: chat.gguf
+compression:
+  enabled: true
+  trigger_at_ratio: 0.75
+  keep_tail_tokens: 8000
+  max_summary_tokens: 2048
+  compressor_model: fast-summarizer
+  on_post_compression_overflow: error
+`)
+		var cfg ModelConfig
+		Expect(yaml.Unmarshal(raw, &cfg)).To(Succeed())
+		Expect(cfg.Compression.Enabled).To(BeTrue())
+		Expect(cfg.Compression.TriggerAtRatio).To(Equal(0.75))
+		Expect(cfg.Compression.KeepTailTokens).To(Equal(8000))
+		Expect(cfg.Compression.MaxSummaryTokens).To(Equal(2048))
+		Expect(cfg.Compression.CompressorModel).To(Equal("fast-summarizer"))
+		Expect(cfg.Compression.OnPostCompressionOverflow).To(Equal("error"))
+	})
+
+	It("rejects invalid context compression policies", func() {
+		cfg := ModelConfig{Compression: CompressionConfig{Enabled: true, TriggerAtRatio: 1.1}}
+		valid, err := cfg.Validate()
+		Expect(valid).To(BeFalse())
+		Expect(err).To(MatchError(ContainSubstring("trigger_at_ratio")))
+
+		cfg.Compression.TriggerAtRatio = 0.75
+		cfg.Compression.OnPostCompressionOverflow = "truncate_anything"
+		valid, err = cfg.Validate()
+		Expect(valid).To(BeFalse())
+		Expect(err).To(MatchError(ContainSubstring("on_post_compression_overflow")))
+	})
+
+	It("rejects context compression for cloud proxy passthrough", func() {
+		cfg := ModelConfig{
+			Backend:     "cloud-proxy",
+			Proxy:       ProxyConfig{Mode: ProxyModePassthrough},
+			Compression: CompressionConfig{Enabled: true},
+		}
+		valid, err := cfg.Validate()
+		Expect(valid).To(BeFalse())
+		Expect(err).To(MatchError(ContainSubstring("cloud-proxy passthrough")))
 	})
 
 	It("derives a managed snapshot filename without replacing the logical model", func() {
@@ -269,17 +315,7 @@ parameters:
 			Expect(valid).To(BeTrue())
 			Expect(err).NotTo(HaveOccurred())
 
-			// download https://raw.githubusercontent.com/mudler/LocalAI/v2.25.0/embedded/models/hermes-2-pro-mistral.yaml
-			httpClient := http.Client{}
-			resp, err := httpClient.Get("https://raw.githubusercontent.com/mudler/LocalAI/v2.25.0/embedded/models/hermes-2-pro-mistral.yaml")
-			Expect(err).To(BeNil())
-			defer resp.Body.Close()
-			tmp, err = os.CreateTemp("", "config.yaml")
-			Expect(err).To(BeNil())
-			defer os.Remove(tmp.Name())
-			_, err = io.Copy(tmp, resp.Body)
-			Expect(err).To(BeNil())
-			configs, err = readModelConfigsFromFile(tmp.Name())
+			configs, err = readModelConfigsFromFile(filepath.Join("testdata", "hermes-2-pro-mistral.yaml"))
 			config = configs[0]
 			Expect(err).To(BeNil())
 			Expect(config).ToNot(BeNil())

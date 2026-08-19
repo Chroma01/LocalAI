@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/mudler/LocalAI/internal/backoff"
 	pb "github.com/mudler/LocalAI/pkg/grpc/proto"
 	"github.com/mudler/LocalAI/pkg/system"
 	"github.com/mudler/LocalAI/pkg/utils"
@@ -94,6 +95,7 @@ type ModelLoader struct {
 	lruEvictionRetryInterval time.Duration // Interval between retries when waiting for busy models
 	onUnloadHooks            []ModelUnloadHook
 	loadObserver             func(BackendLoadEvent)
+	loadLifecycleObserver    func(BackendLoadEvent) (func(BackendLoadEvent), error)
 	remoteUnloader           RemoteModelUnloader
 	modelRouter              ModelRouter // distributed mode: route to remote node
 	backendLogs              *BackendLogStore
@@ -200,17 +202,8 @@ func (ml *ModelLoader) recordLoadFailure(modelID string) {
 		ml.loadFailures[modelID] = st
 	}
 	st.consecutive++
-	// base * 2^(consecutive-1), clamped. Cap the shift to avoid overflowing
-	// the Duration; anything past the cap collapses to loadFailureMaxCooldown.
-	shift := st.consecutive - 1
-	if shift > 20 {
-		shift = 20
-	}
-	backoff := ml.loadFailureBaseCooldown * (1 << shift)
-	if backoff <= 0 || backoff > ml.loadFailureMaxCooldown {
-		backoff = ml.loadFailureMaxCooldown
-	}
-	st.cooldownUntil = time.Now().Add(backoff)
+	delay := backoff.Exponential(ml.loadFailureBaseCooldown, ml.loadFailureMaxCooldown, uint(st.consecutive-1))
+	st.cooldownUntil = time.Now().Add(delay)
 }
 
 // clearLoadFailure resets the modelID's failure state after a successful load.
@@ -254,6 +247,24 @@ func (ml *ModelLoader) notifyLoadObserver(ev BackendLoadEvent) {
 	if obs != nil {
 		obs(ev)
 	}
+}
+
+// SetLoadLifecycleObserver registers a begin callback whose returned function
+// is invoked when the same real backend load attempt finishes.
+func (ml *ModelLoader) SetLoadLifecycleObserver(obs func(BackendLoadEvent) (func(BackendLoadEvent), error)) {
+	ml.mu.Lock()
+	defer ml.mu.Unlock()
+	ml.loadLifecycleObserver = obs
+}
+
+func (ml *ModelLoader) notifyLoadStarted(ev BackendLoadEvent) (func(BackendLoadEvent), error) {
+	ml.mu.Lock()
+	obs := ml.loadLifecycleObserver
+	ml.mu.Unlock()
+	if obs == nil {
+		return nil, nil
+	}
+	return obs(ev)
 }
 
 // SetRemoteUnloader sets the handler for unloading models on remote nodes.
